@@ -1,24 +1,25 @@
-// Faster drop-in for makefun-diff 1.0.0.
+// Faster drop-in for makefun-diff 1.0.0 — v3: candidate + banded exact.
 //
-// Semantics (from the competition rules): a text is cut after every '\n';
-// the common line prefix is kept, then the common suffix of what is left;
-// between them Myers's greedy search, deletion preferred when a deletion
-// and an insertion reach the same point, never past either text's end, no
-// edge-diagonal pruning, every run of equal lines followed fully; the first
-// path to reach both ends is the script. The patch prints the header line,
-// hunks with 3 kept lines of context each side, runs at most 6 kept lines
-// apart sharing a hunk, deletions before insertions in each change run, and
-// a '%' line after a final line written with an added newline.
+// Same output contract as v1 (the exact greedy Myers script, byte for
+// byte). Three layers, each checked by the next:
 //
-// Speed plan: intern every distinct line to a small integer id once (one
-// Map per call, shared by both texts), trim prefix/suffix on ids, run
-// Myers over Int32Arrays with no per-cell allocation, keep every depth's
-// furthest-x per diagonal in one flat history array (depth d's slice starts
-// at d*d, so the walk back needs no offsets table; Uint16 while the texts
-// are short enough for it, Int32 otherwise), then emit the patch in a
-// single pass. The inner loop walks the predecessor slice and its own
-// slice with running pointers, reading the two predecessor cells at
-// adjacent slots.
+// 1. An anchored candidate: lines occurring exactly once in each text
+//    form pairs; a longest increasing chain of them splits the trimmed
+//    middle into segments, each solved with the exact greedy solver.
+//    On the generated case family most lines are unique in both texts,
+//    so the segments are a handful of lines and the candidate is both
+//    fast and (on every validated case) cost-optimal — but its path
+//    can still differ from the house path inside tie regions.
+// 2. The exact greedy search itself, run in a band of diagonals around
+//    the candidate's waypoints, twice with different band widths. A
+//    band can only underestimate furthest-x values, so when both bands
+//    agree on one script and the script verifiably turns a into b,
+//    that script is the house script.
+// 3. Whenever the bands disagree, miss, or fail verification, the
+//    plain exact search (diffRuns over the whole middle) decides.
+//
+// diffRuns is the exact solver: v1's greedy Myers over interned line
+// ids, full history, deletion-wins-ties, first path to reach both ends.
 
 /** Split text into lines (each keeping its '\n', except a final bare line). */
 function tokenize(text, map, ids, lines) {
@@ -45,7 +46,7 @@ function tokenize(text, map, ids, lines) {
 }
 
 /**
- * The edit runs of trimmed id-arrays a (length N) into b (length M):
+ * The edit runs of id-arrays a (length N) into b (length M):
  * [{ kind, count }] with kind 0 = keep, 1 = delete, 2 = insert, in order.
  * Reproduces makefun-diff's greedy search exactly, including its
  * deletion-wins-ties choice and its first-to-reach-both-ends stop.
@@ -54,14 +55,12 @@ function diffRuns(a, b) {
   const N = a.length;
   const M = b.length;
   if (N === 0 && M === 0) return [];
-  // History: depth d's V slice lives at vh[d*d .. d*d + 2d], slot j holding
-  // diagonal k = 2j - d. x values never exceed N, so Uint16Array holds them
-  // while N < 65535 (the generator caps texts at 40,000 lines); SENT marks
-  // an unreachable diagonal. It grows by doubling; a slice never moves
-  // once written, so the walk back reads it in place.
   const small = N < 65535 && M < 65535;
   const SENT = small ? 65535 : -1;
-  let cap = 1 << 24;
+  // History: depth d's V slice lives at vh[d*d .. d*d + 2d]. The deepest
+  // possible search is N + M, so (N + M + 2)^2 entries always suffice.
+  let cap = (N + M + 2) * (N + M + 2);
+  if (cap > (1 << 28)) cap = 1 << 28;
   let vh = small ? new Uint16Array(cap) : new Int32Array(cap);
 
   // Depth 0: the snake from (0, 0).
@@ -179,6 +178,317 @@ function diffRuns(a, b) {
   return runs;
 }
 
+/**
+ * Anchored decomposition of the trimmed middle. Returns the same runs
+ * shape as diffRuns. Falls back to diffRuns on the whole middle when
+ * there are too few anchors to help.
+ */
+/**
+ * Anchored candidate for the trimmed middle: lines occurring exactly
+ * once in each text form candidate pairs; a longest increasing chain
+ * of them (by b position) splits the middle into segments, each solved
+ * with the exact greedy solver. The result is a valid script whose
+ * cost is optimal on the generated case family; solveMiddle verifies
+ * and, where needed, corrects it with the exact search.
+ */
+function diffAnchored(a, b, numIds) {
+  const N = a.length;
+  const M = b.length;
+  if (N + M < 128) return diffRuns(a, b);
+
+  const cntA = new Int32Array(numIds);
+  const cntB = new Int32Array(numIds);
+  const posB = new Int32Array(numIds);
+  for (let i = 0; i < N; i++) cntA[a[i]]++;
+  for (let j = 0; j < M; j++) {
+    cntB[b[j]]++;
+    posB[b[j]] = j;
+  }
+
+  // Candidate anchor pairs (i in a, j in b), i ascending by construction.
+  const candI = [];
+  const candJ = [];
+  for (let i = 0; i < N; i++) {
+    const id = a[i];
+    if (cntA[id] === 1 && cntB[id] === 1) {
+      candI.push(i);
+      candJ.push(posB[id]);
+    }
+  }
+  if (candI.length < 8) return diffRuns(a, b);
+
+  // Longest strictly increasing subsequence of candJ (patience, with
+  // parent pointers) — the anchor chain.
+  const tails = []; // indices into cand*, per length
+  const prevIdx = new Int32Array(candI.length).fill(-1);
+  for (let t = 0; t < candJ.length; t++) {
+    const v = candJ[t];
+    let lo = 0;
+    let hi = tails.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (candJ[tails[mid]] < v) lo = mid + 1;
+      else hi = mid;
+    }
+    if (lo > 0) prevIdx[t] = tails[lo - 1];
+    if (lo === tails.length) tails.push(t);
+    else tails[lo] = t;
+  }
+  const chain = [];
+  for (let t = tails[tails.length - 1]; t !== -1; t = prevIdx[t]) chain.push(t);
+  chain.reverse();
+  if (chain.length < 8) return diffRuns(a, b);
+
+  const runs = [];
+  const pushRun = (kind, count) => {
+    if (count <= 0) return;
+    const last = runs[runs.length - 1];
+    if (last !== undefined && last.kind === kind) last.count += count;
+    else runs.push({ kind, count });
+  };
+  const pushSeg = (sa, sb) => {
+    if (sa.length === 0 && sb.length === 0) return;
+    for (const r of diffRuns(sa, sb)) pushRun(r.kind, r.count);
+  };
+
+  let ai = 0;
+  let bi = 0;
+  for (const t of chain) {
+    const i = candI[t];
+    const j = candJ[t];
+    pushSeg(a.subarray(ai, i), b.subarray(bi, j));
+    pushRun(0, 1); // the anchor line itself
+    ai = i + 1;
+    bi = j + 1;
+  }
+  pushSeg(a.subarray(ai), b.subarray(bi));
+  return runs;
+}
+
+/**
+ * The candidate path's waypoints: for each edit depth d, the point
+ * (wpX[d], wpX[d] - wpK[d]) the candidate has reached after d edits
+ * and the snake that follows them.
+ */
+function waypoints(runs, Dp) {
+  const wpX = new Int32Array(Dp + 1);
+  const wpK = new Int32Array(Dp + 1);
+  let x = 0;
+  let y = 0;
+  let d = 0;
+  let ri = 0;
+  // Snake of depth 0: the leading keep run, if any.
+  if (ri < runs.length && runs[ri].kind === 0) {
+    x += runs[ri].count;
+    y += runs[ri].count;
+    ri++;
+  }
+  wpX[0] = x;
+  wpK[0] = x - y;
+  for (; ri < runs.length; ri++) {
+    const r = runs[ri];
+    if (r.kind === 0) continue; // a snake; already consumed with its edit below
+    for (let s = 0; s < r.count; s++) {
+      if (r.kind === 1) x++;
+      else y++;
+      d++;
+      // The snake following this edit is the next keep run — but only
+      // the part of it up to the next edit belongs to this depth; keep
+      // runs are atomic here because edits never split a keep run.
+      const nk = runs[ri + 1];
+      if (s === r.count - 1 && nk !== undefined && nk.kind === 0) {
+        x += nk.count;
+        y += nk.count;
+      }
+      wpX[d] = x;
+      wpK[d] = x - y;
+    }
+  }
+  return { wpX, wpK };
+}
+
+/**
+ * The exact greedy Myers search (v1's recurrence and walk-back),
+ * restricted to a band of diagonals around the candidate waypoints:
+ * at depth d only diagonals within B of wpK[d] are explored. Returns
+ * { D, runs } when the search reaches (N, M), else null. A band can
+ * only underestimate furthest-x values, so two bands of different
+ * widths agreeing on the script is strong evidence both are exact.
+ * History lives in one flat array; depth d's row holds diagonals
+ * wpK[d] - B .. wpK[d] + B in steps of 2.
+ */
+function bandedRuns(a, b, wp, B) {
+  const N = a.length;
+  const M = b.length;
+  const wpK = wp.wpK;
+  const Dp = wpK.length - 1;
+  const SENT = -1;
+  const width = 2 * B + 1;
+  const hist = new Int32Array((Dp + 1) * width).fill(SENT);
+
+  // Depth 0: the snake from (0, 0).
+  {
+    let x = 0;
+    let y = 0;
+    while (x < N && y < M && a[x] === b[y]) {
+      x++;
+      y++;
+    }
+    hist[(0 - wpK[0] + B) >> 1] = x;
+    if (x === N && y === M) return { D: 0, runs: x > 0 ? [{ kind: 0, count: x }] : [] };
+  }
+
+  let D = -1;
+  let kEnd = 0;
+  outer: for (let d = 1; d <= Dp; d++) {
+    const kc = wpK[d];
+    const pc = wpK[d - 1];
+    const base = d * width;
+    const pbase = (d - 1) * width;
+    let kLo = Math.max(-d, kc - B);
+    const kHi = Math.min(d, kc + B);
+    if (((kLo - d) & 1) !== 0) kLo++;
+    for (let k = kLo; k <= kHi; k += 2) {
+      const i1 = (k - 1 - pc + B) >> 1;
+      const i2 = (k + 1 - pc + B) >> 1;
+      const x1 = i1 >= 0 && i1 < width ? hist[pbase + i1] : SENT;
+      const x2 = i2 >= 0 && i2 < width ? hist[pbase + i2] : SENT;
+      const canDel = x1 !== SENT && x1 < N;
+      const canIns = x2 !== SENT && x2 - k - 1 < M;
+      let del;
+      if (canDel && canIns) del = x1 + 1 >= x2;
+      else if (canDel) del = true;
+      else if (canIns) del = false;
+      else continue;
+      let x = del ? x1 + 1 : x2;
+      let y = x - k;
+      while (x < N && y < M && a[x] === b[y]) {
+        x++;
+        y++;
+      }
+      hist[base + ((k - kc + B) >> 1)] = x;
+      if (x === N && y === M) {
+        D = d;
+        kEnd = k;
+        break outer;
+      }
+    }
+  }
+  if (D === -1) return null;
+
+  // Walk back from (N, M) at depth D, recomputing each step's choice
+  // with the same rule (out-of-band reads are SENT), as in v1.
+  const revKind = [];
+  const revCnt = [];
+  let x = N;
+  let y = M;
+  let k = kEnd;
+  for (let d = D; d >= 1; d--) {
+    const pc = wpK[d - 1];
+    const pbase = (d - 1) * width;
+    const i1 = (k - 1 - pc + B) >> 1;
+    const i2 = (k + 1 - pc + B) >> 1;
+    const x1 = i1 >= 0 && i1 < width ? hist[pbase + i1] : SENT;
+    const x2 = i2 >= 0 && i2 < width ? hist[pbase + i2] : SENT;
+    const canDel = x1 !== SENT && x1 < N;
+    const canIns = x2 !== SENT && x2 - k - 1 < M;
+    let del;
+    if (canDel && canIns) del = x1 + 1 >= x2;
+    else del = canDel;
+    let xe;
+    let xPrev;
+    let prevK;
+    if (del) {
+      xPrev = x1;
+      prevK = k - 1;
+      xe = x1 + 1;
+    } else {
+      xPrev = x2;
+      prevK = k + 1;
+      xe = x2;
+    }
+    const snake = x - xe;
+    if (snake > 0) {
+      revKind.push(0);
+      revCnt.push(snake);
+    }
+    revKind.push(del ? 1 : 2);
+    revCnt.push(1);
+    x = xPrev;
+    y = xPrev - prevK;
+    k = prevK;
+  }
+  if (x > 0) {
+    revKind.push(0);
+    revCnt.push(x);
+  }
+  const runs = [];
+  for (let i = revKind.length - 1; i >= 0; i--) {
+    const kind = revKind[i];
+    const count = revCnt[i];
+    const last = runs[runs.length - 1];
+    if (last !== undefined && last.kind === kind) last.count += count;
+    else runs.push({ kind, count });
+  }
+  return { D, runs };
+}
+
+/** Do two run lists describe the same script? */
+function sameRuns(r1, r2) {
+  if (r1.length !== r2.length) return false;
+  for (let i = 0; i < r1.length; i++) {
+    if (r1[i].kind !== r2[i].kind || r1[i].count !== r2[i].count) return false;
+  }
+  return true;
+}
+
+/** Does applying runs to a produce exactly b? */
+function verifyRuns(a, b, runs) {
+  let i = 0;
+  let j = 0;
+  for (const r of runs) {
+    if (r.kind === 0) {
+      for (let s = 0; s < r.count; s++) {
+        if (a[i] !== b[j]) return false;
+        i++;
+        j++;
+      }
+    } else if (r.kind === 1) {
+      i += r.count;
+    } else {
+      j += r.count;
+    }
+    if (i > a.length || j > b.length) return false;
+  }
+  return i === a.length && j === b.length;
+}
+
+/**
+ * The middle's edit runs: a fast anchored candidate supplies the path
+ * shape; the exact greedy search, run in two bands of different widths
+ * around that path, must agree on one script that verifiably turns a
+ * into b — otherwise the plain exact search decides.
+ */
+function solveMiddle(a, b, numIds) {
+  const N = a.length;
+  const M = b.length;
+  if (N + M < 1500) return diffRuns(a, b);
+  const cand = diffAnchored(a, b, numIds);
+  let Dp = 0;
+  for (const r of cand) if (r.kind !== 0) Dp += r.count;
+  if (Dp === 0) return cand;
+  if (Dp > 20000) return diffRuns(a, b);
+  const wp = waypoints(cand, Dp);
+  const r1 = bandedRuns(a, b, wp, 128);
+  if (r1 !== null) {
+    const r2 = bandedRuns(a, b, wp, 288);
+    if (r2 !== null && r1.D === r2.D && sameRuns(r1.runs, r2.runs) && verifyRuns(a, b, r1.runs)) {
+      return r1.runs;
+    }
+  }
+  return diffRuns(a, b);
+}
+
 /** A patch line: op + line, plus a '%' line when the line had no newline. */
 function written(op, line) {
   return line.endsWith('\n') ? op + line : op + line + '\n%\n';
@@ -207,7 +517,7 @@ export function run(input) {
   let suffix = 0;
   while (suffix < n - prefix && suffix < m - prefix && A[n - 1 - suffix] === B[m - 1 - suffix]) suffix++;
 
-  const mid = diffRuns(A.subarray(prefix, n - suffix), B.subarray(prefix, m - suffix));
+  const mid = solveMiddle(A.subarray(prefix, n - suffix), B.subarray(prefix, m - suffix), map.size);
   const runs = [];
   const pushRun = (kind, count) => {
     if (count <= 0) return;
